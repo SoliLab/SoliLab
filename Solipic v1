@@ -1,0 +1,374 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import numpy as np
+import pandas as pd
+import talib as TA
+from Installation.hkstock import filter1
+from Installation.printtime import *
+from Installation.Context import *
+from Installation.TA_all import *
+from installation import *
+
+pd.set_option('display.float_format', lambda x: '%.2f' % x)
+# @markdown 技術 上穿下穿
+def cross_over_up(df, TA1, TA2):
+    TA1_TA2 = np.where((df[TA1] - df[TA2]) > 0, 1, 0)
+    Enter1 = np.pad(np.where(np.diff(TA1_TA2) == 1, 1, 0), (1, 0), "constant")
+    Enter = pd.Series(Enter1, index=list(df.index))
+    return Enter
+
+
+def cross_over_down(df, TA1, TA2):
+    TA1_TA2 = np.where((df[TA1] - df[TA2]) < 0, 1, 0)
+    Enter1 = np.pad(np.where(np.diff(TA1_TA2) == 1, 1, 0), (1, 0), "constant")
+    Enter = pd.Series(Enter1, index=list(df.index))
+    return Enter
+
+
+# # 2.運算Solipic
+def Run_Solipic(raw):
+    t0 = time.time()
+    # @markdown <h4>← 分辨OHLC, 建立技術指標參數：EMA RSI SKDJ
+    def ohlc_gen(data_filter):
+        # Fetch daily stock data
+        data = data_filter.copy()
+        MALINE = 100  # 自定義
+        data["MALINE"] = TA.MA(data["close"], MALINE)  # 技術指標
+        data = data.fillna(method='bfill')
+        # S01 變數
+        day1 = 21
+        dayemaz = 5
+        data["AVGVS01"] = (data["close"] * 2 + data["high"] + data["low"]) / 4
+        data["EMAS01"] = TA.EMA(data["AVGVS01"], day1)
+        data["STDS01"] = TA.STDDEV(data["AVGVS01"], day1)
+        data["ZScore1"] = ((data["AVGVS01"] - data["EMAS01"]) / data["STDS01"] * 100 + 200) / 4
+        data["ZScore"] = data["ZScore1"].fillna(method='bfill')
+        data["EMAZScore"] = (TA.EMA(data["ZScore"], dayemaz) - 25) * 1.56
+
+        # 數據改NAN為向上填充
+        data = data.fillna(method='bfill')
+        data["AK"] = TA.EMA(data["EMAZScore"], 2) * 1.22  # S01 AK AD
+        data["AD"] = TA.EMA(data["AK"], 2)
+
+        # S02 變數
+        day = 34
+        day_sk = 13
+        day_sd = 3
+        data["AVGVS02"] = (data["close"] * 2 + data["high"] + data["low"] + data["open"]) / 5
+        data["HHV"] = TA.MAX(data["high"], day)  # original period 34
+        data["LLV"] = TA.MIN(data["low"], day)
+
+        # S02 SK SD
+        data["Diff"] = (data["AVGVS02"] - data["LLV"]) / (data["HHV"] - data["LLV"]) * 100
+        data["SK"] = TA.EMA(data["Diff"], day_sk)  # orginal 13 #數據改NAN為向上填充
+        data = data.fillna(method='bfill')
+        data["SD"] = TA.EMA(data['SK'], day_sd)  # orginal 3
+
+        condition1 = (data["AK"].shift(1) < data["AD"].shift(1)) & (data["AK"] > data["AD"])  # S01 上穿
+        condition2 = (data["SK"].shift(1) < data["SD"].shift(1)) & (data["SK"] > data["SD"])  # S02 上穿
+        condition3 = data["SD"] < 50
+
+        condition4 = (data["AK"].shift(1) > data["AD"].shift(1)) & (data["AK"] < data["AD"])  # S01 下穿
+        condition5 = (data["SK"].shift(1) > data["SD"].shift(1)) & (data["SK"] < data["SD"])  # S02 下穿
+        condition6 = data["SD"] > 50
+
+        data.loc[condition1 & condition2 & condition3, 'best price'] = 1  # 最佳買入位
+        data.loc[(condition1 == 0) & condition2 & condition3, 'better price'] = 1  # 較好買入位
+
+        data.loc[condition4 & condition5 & condition6, 'worst price'] = -1  # 最佳沽出位
+        data.loc[(condition4 == 0) & condition5 & condition6, 'worse price'] = -1  # 較好沽出位
+
+        data.fillna(value=0, inplace=True)  # 将初始行数的signal补全为0
+        data.drop(['AVGVS01', 'EMAS01', 'STDS01', 'ZScore1', 'ZScore', 'EMAZScore',
+                   'AVGVS02', 'HHV', 'LLV', 'Diff', 'vol', 'volume'],
+                  axis=1, inplace=True)
+
+        L = data[data.index >= list(data.index)[50]]
+        return (L)
+
+
+    def alert_calculate(data):
+        alert1 = {}
+
+        alert1["date"] = data["date"][-1]
+        # alert1["Stock_Code"]=data["Stock_Code"][-1]
+        alert1["close"] = data["close"][-1]
+        alert1["MALINE"] = data["MALINE"][-1]
+
+        alert1["best price"] = data['best price'][-1]
+        alert1["better price"] = data['better price'][-1]
+        alert1["worst price"] = data['worst price'][-1]
+        alert1["worse price"] = data['worse price'][-1]
+
+        return alert1  # alert_OHLC1
+
+
+    L_result = {}
+    #Error = []
+    for i in range(len(raw)):
+        try:
+            data3 = [x for x in raw][i]
+            # print(data3)
+
+            data = data3[1].copy()  # 股票的數據
+            code1 = data['ticker'][0]  # 股票號碼
+
+            # 清洗數據，增加成交額欄目
+            D = filter1(data)  # filter1(datasource, turnover, MAturnover)
+            if D["MAturnover"][-1] < 5:  # 篩選月均成交額要大於MAturnover
+                continue
+
+            if len(D) < 60:  # 一定要大過40日，否則技術指標出不了
+                continue
+                # print(code1, '日期1：{:} 日期2： {:} '.format(D["date"][-2],D["date"][-1]) ,"-----Item",i+1)
+            OHLC = ohlc_gen(D)  # 增加指標參數
+            alert_OHLC = alert_calculate(OHLC)  # 利用指標參數，選出alert signal數值
+            L_result[code1] = alert_OHLC  # 在L result list, 為指定股票增設signal數值
+
+        except KeyboardInterrupt:
+            print('GoodBye. My Lord.')
+            break
+
+
+    def alert_gen(L1):  # 產生股票號碼列表 solipic from alert_gen
+        D1 = {}
+        L_Better, L_Better_filter1, L_Best, L_Best_filter1, L_Worse, L_Worst = [[] for _ in range(6)]
+        D1["date"] = list(L1.values())[0]["date"]
+        for i in range(len(L1.keys())):
+            # 上升趨勢
+            if list(L1.values())[i]["best price"] == 1:  # 篩選Better Price SD<50
+                # for Solipic 最佳買入位
+                L_Best.append(list(L1.keys())[i])
+                if list(L1.values())[i]["close"] > list(L1.values())[i]["MALINE"]:  # 篩選MA250
+                    L_Best_filter1.append(list(L1.keys())[i])
+                if len(L_Best_filter1) == 0:
+                    D1["Best_filter1"] = None
+                else:
+                    D1["Best_filter1"] = L_Best_filter1
+            if len(L_Best) == 0:
+                D1["Best"] = None
+            else:
+                D1["Best"] = L_Best
+
+            # for Solipic 較好買入位
+            if list(L1.values())[i]["better price"] == 1:
+                L_Better.append(list(L1.keys())[i])
+                if list(L1.values())[i]["close"] > list(L1.values())[i]["MALINE"]:  # 篩選MA250
+                    L_Better_filter1.append(list(L1.keys())[i])
+                if len(L_Better_filter1) == 0:
+                    D1["Better_filter1"] = None
+                else:
+                    D1["Better_filter1"] = L_Better_filter1
+            if len(L_Better) == 0:
+                D1["Better"] = None
+            else:
+                D1["Better"] = L_Better
+
+            # 下跌趨勢
+            if list(L1.values())[i]["worst price"] == -1:  # 篩選Better Price SD>50
+                # for Solipic Worst Price 長期轉向下
+                L_Worst.append(list(L1.keys())[i])
+            if len(L_Worst) == 0:
+                D1["Worst"] = None
+            else:
+                D1["Worst"] = L_Worst
+
+            # for Solipic Worse Price 短期轉向下
+            if list(L1.values())[i]["worse price"] == 1:
+                L_Worse.append(list(L1.keys())[i])
+            if len(L_Worse) == 0:
+                D1["Worse"] = None
+            else:
+                D1["Worse"] = L_Worse
+        return D1
+
+    alert = alert_gen(L_result)
+
+    def emailcontent(data_alert):  # solipic電郵內容定義
+        nowtime = time.strftime('%Y{y}%m{m}%d{d} %H{h}%M{f}%S{s}').format(y='年', m='月', d='日', h='時', f='分', s='秒')
+        #   print(printtime2)
+        data_alert.setdefault('Best_filter1', None)
+        data_alert.setdefault('Better_filter1', None)
+        session1 = "資料日期: " + data_alert["date"] + "\n"
+        session1 = session1 + "更新時間: " + nowtime + "\n"
+        session1 = session1 + "Solipic 短時間內只會出現一次訊號，基於市場波動理由，以收市前的訊號為準 "  + "\n"
+        session1 = session1 + "Solipic 最佳買入位:" + "\n" + join1(data_alert["Best_filter1"]) + "\n\n"
+        session1 = session1 + "Solipic 較好買入位:" + "\n" + join1(data_alert["Better_filter1"]) + "\n\n"
+        session1 = session1 + "Solipic 最佳買入位（初選）:" + "\n" + join1(data_alert["Best"]) + "\n\n"
+        session1 = session1 + "Solipic 較好買入位（初選）:" + "\n" + join1(data_alert["Better"]) + "\n\n"
+        session1 = session1 + "Solipic 長線過高轉勢:" + "\n" + join1(data_alert["Worst"]) + "\n\n"
+        session1 = session1 + "Solipic 短線過高轉勢:" + "\n" + join1(data_alert["Worse"]) + "\n\n\n"
+
+        return (session1)
+
+    content = emailcontent(alert)
+    # print("Run_EMA含有1.所有結果的DICT，2.篩選列表，3.結果內容")
+    # print(content)
+    elapsed = time.time() - t0
+    print("Run_Solipic 運行需時： ",elapsed)
+    if time_period("09:30", "12:00"):   turnover = 5
+    else: turnover =10
+    content_solipic = content + "此次Solipic 篩選成交額高於{:}M的股票。".format(turnover)
+
+    # ## Telegram 部分
+    soli = "140816053"
+    updater.dispatcher.bot.send_message(chat_id = soli, text = content_solipic)
+
+    return L_result, alert, content
+
+
+
+
+def Run_Solipic_best(raw,days = 2):
+    time_start = time.time()
+    def ohlc_gen(data_filter):
+        # Fetch daily stock data
+        data = data_filter.copy()
+        MALINE = 100  # 自定義
+        data["MALINE"] = TA.MA(data["close"], MALINE)  # 技術指標
+        data = data.fillna(method='bfill')
+        # S01 變數
+        day1 = 21
+        dayemaz = 5
+        data["AVGVS01"] = (data["close"] * 2 + data["high"] + data["low"]) / 4
+        data["EMAS01"] = TA.EMA(data["AVGVS01"], day1)
+        data["STDS01"] = TA.STDDEV(data["AVGVS01"], day1)
+        data["ZScore1"] = ((data["AVGVS01"] - data["EMAS01"]) / data["STDS01"] * 100 + 200) / 4
+        data["ZScore"] = data["ZScore1"].fillna(method='bfill')
+        data["EMAZScore"] = (TA.EMA(data["ZScore"], dayemaz) - 25) * 1.56
+
+        # 數據改NAN為向上填充
+        data = data.fillna(method='bfill')
+        data["AK"] = TA.EMA(data["EMAZScore"], 2) * 1.22  # S01 AK AD
+        data["AD"] = TA.EMA(data["AK"], 2)
+
+        # S02 變數
+        day = 34
+        day_sk = 13
+        day_sd = 3
+        data["AVGVS02"] = (data["close"] * 2 + data["high"] + data["low"] + data["open"]) / 5
+        data["HHV"] = TA.MAX(data["high"], day)  # original period 34
+        data["LLV"] = TA.MIN(data["low"], day)
+
+        # S02 SK SD
+        data["Diff"] = (data["AVGVS02"] - data["LLV"]) / (data["HHV"] - data["LLV"]) * 100
+        data["SK"] = TA.EMA(data["Diff"], day_sk)  # orginal 13 #數據改NAN為向上填充
+        data = data.fillna(method='bfill')
+        data["SD"] = TA.EMA(data['SK'], day_sd)  # orginal 3
+
+        condition1 = (data["AK"].shift(1) < data["AD"].shift(1)) & (data["AK"] > data["AD"])  # S01 上穿
+        condition2 = (data["SK"].shift(1) < data["SD"].shift(1)) & (data["SK"] > data["SD"])  # S02 上穿
+        condition3 = data["SD"] < 50
+
+        condition4 = (data["AK"].shift(1) > data["AD"].shift(1)) & (data["AK"] < data["AD"])  # S01 下穿
+        condition5 = (data["SK"].shift(1) > data["SD"].shift(1)) & (data["SK"] < data["SD"])  # S01 下穿
+        condition6 = data["SD"] > 50
+
+        data.loc[condition1 & condition2 & condition3, 'best price'] = 1  # 最佳買入位
+        data.loc[(condition1 == 0) & condition2 & condition3, 'better price'] = 1  # 較好買入位
+
+        data.loc[condition4 & condition5 & condition6, 'worst price'] = -1  # 最佳沽出位
+        data.loc[(condition4 == 0) & condition5 & condition6, 'worse price'] = -1  # 較好沽出位
+
+        data.fillna(value=0, inplace=True)  # 将初始行数的signal补全为0
+        data.drop(['AVGVS01', 'EMAS01', 'STDS01', 'ZScore1', 'ZScore', 'EMAZScore',
+                   'AVGVS02', 'HHV', 'LLV', 'Diff', 'vol', 'volume'],
+                  axis=1, inplace=True)
+
+        L = data[data.index >= list(data.index)[50]]
+        return (L)
+
+    def alert_calculate2(data, i = 1):
+        alert1 = {}
+
+        alert1["date"] = data["date"][-i]
+        alert1["ticker"]=data["ticker"][-1]
+        alert1["close"] = data["close"][-i]
+        alert1["MALINE"] = data["MALINE"][-i]
+        alert1["best price"] = data['best price'][-i]
+
+        return alert1  # alert_OHLC1
+
+    def alert_gen2(L1):  # 產生股票號碼列表 solipic from alert_gen
+        D1 = {}
+        L_Best = []
+    #         L_Better, L_Better_filter1, L_Best, L_Best_filter1, L_Worse, L_Worst = [[] for _ in range(6)]
+    #         D1["date"] = list(L1.values())[0]["date"]
+        for i in range(len(L1.keys())):
+            # 上升趨勢
+            if list(L1.values())[i]["best price"] ==1:
+                if list(L1.values())[i]["close"] > list(L1.values())[i]["MALINE"]:  # 篩選MA250
+                # for Solipic 最佳買入位
+                    L_Best.append(list(L1.keys())[i])
+            if len(L_Best) == 0:
+                D1["Best"] = None
+            else:
+                D1["Best"] = L_Best
+        return D1
+    L_result = {}
+    try:
+        df = pd.read_pickle("data_Solipic.pik")
+        alert = df.to_dict()
+    except:
+        alert = {}
+
+    for j in range(1, days):
+        for i in range(len(raw)):
+            try:
+                data3 = [x for x in raw][i]
+                # print(data3)
+
+                data = data3[1].copy()  # 股票的數據
+                code1 = data['ticker'][0]  # 股票號碼
+
+                # 清洗數據，增加成交額欄目
+                D = filter1(data)  # filter1(datasource, turnover, MAturnover)
+                if D["MAturnover"][-1] < 5:  # 篩選月均成交額要大於MAturnover
+                    continue
+
+                if len(D) < 60:  # 一定要大過40日，否則技術指標出不了
+                    continue
+                    # print(code1, '日期1：{:} 日期2： {:} '.format(D["date"][-2],D["date"][-1]) ,"-----Item",i+1)
+                OHLC = ohlc_gen(D)  # 增加指標參數
+
+                alert_OHLC = alert_calculate2(OHLC, j)  # 利用指標參數，選出alert signal數值
+                L_result[code1] = alert_OHLC
+
+            except KeyboardInterrupt:
+                print('GoodBye. My Lord.')
+                break
+        alert[list(alert_OHLC.values())[0]] = alert_gen2(L_result)
+
+    myKeys = list(alert.keys())
+    myKeys.sort(reverse=True)
+    alert_sorted = {i: alert[i] for i in myKeys}
+    df = pd.DataFrame(alert_sorted)
+    df.to_pickle("data_Solipic.pik")
+    filename2 = path_data + today + "signal record.pik"
+    df.to_pickle(filename2)
+    total_data = len(myKeys)
+    print('number of data = ', total_data)
+    def emailcontent2(data_alert,days2 = 15):  # solipic電郵內容定義
+        nowtime = time.strftime('%Y{y}%m{m}%d{d} %H{h}%M{f}%S{s}').format(y='年', m='月', d='日', h='時', f='分', s='秒')
+        #   print(printtime2)
+        session1 = "資料日期 + 更新時間: " + nowtime + "\n"
+        session1 = session1 + "Solipic 短時間內只會出現一次，基於市場波動理由，以收市前的訊號為準 " + "\n"
+        session1 = session1 + 'Solipic 最近{:}交易日最佳買入位推測:'.format(days2-1) + "\n"
+        try:
+            for i in range(0, days2-1):
+                session1 = session1 + list(data_alert.keys())[i] + " : " + join1(list(data_alert.values())[i]["Best"]) + "\n"
+        except:
+            session1 = session1 + list(data_alert.keys())[0] + " : " + join1(list(data_alert.values())[0]["Best"]) + "\n"
+        return (session1)
+
+    content2 = emailcontent2(alert_sorted, min(total_data,16))
+    # print(content2)
+    elapsed = time.time() - time_start
+    print('運行需時：', elapsed)
+
+    # ## Telegram 部分
+    soli = "140816053"
+    updater.dispatcher.bot.send_message(chat_id=soli, text=content2)
+
+    return alert,content2
